@@ -1,0 +1,59 @@
+# SSH into your Oracle Cloud instance from a throwaway container.
+# The private key lives in a Docker volume, not on your laptop's disk.
+#
+# ONE-TIME SETUP
+#   1. Create a .env file with your OCI configuration (see .env.example)
+#   2. Under `import-key`, set `source:` to the path of your downloaded private key.
+#   3. Run:  docker compose run --rm import-key
+#      Then delete the original key file from Downloads and empty the Trash.
+#
+# EVERY TIME AFTER
+#   docker compose run --rm ssh
+
+name: oci-ssh
+
+services:
+  ssh:
+    build:
+      dockerfile_inline: |
+        FROM alpine:3.20
+        RUN apk add --no-cache openssh-client
+    image: oci-ssh:local
+    stdin_open: true
+    tty: true
+    env_file:
+      - .env
+    volumes:
+      - oci-keys:/keys:ro
+      - oci-known-hosts:/root/.ssh # remembers the server's fingerprint between runs
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        case "$$OCI_HOST" in ""|PASTE*) echo "Set OCI_HOST in .env file to your instance public IP."; exit 1;; esac
+        [ -f "/keys/$$OCI_KEY" ] || { echo "Key not found in the oci-keys volume. Run: docker compose run --rm import-key"; exit 1; }
+        cp "/keys/$$OCI_KEY" /tmp/k && chmod 400 /tmp/k
+        exec ssh -i /tmp/k -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 "$$OCI_USER@$$OCI_HOST"
+
+  # One-time: copies your private key into the oci-keys volume with the name specified in OCI_KEY environment variable.
+  import-key:
+    profiles: ["setup"]
+    image: alpine:3.20
+    env_file:
+      - .env
+    volumes:
+      - oci-keys:/keys
+      - ./:/src:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        [ -f "/src/$$OCI_KEY" ] || { echo "Private key file $$OCI_KEY not found in current directory."; exit 1; }
+        grep -q "PRIVATE KEY" /src/$$OCI_KEY || { echo "That file does not look like a private key."; exit 1; }
+        cp /src/$$OCI_KEY /keys/"${OCI_KEY:-id_oci}" && chmod 400 /keys/"${OCI_KEY:-id_oci}"
+        echo "✓ Private key imported to oci-keys volume as ${OCI_KEY:-id_oci}"
+        echo "Key imported into the oci-keys volume. Delete the original from Downloads and empty the Trash."
+
+volumes:
+  oci-keys:
+    name: oci-keys
+  oci-known-hosts:
+    name: oci-known-hosts

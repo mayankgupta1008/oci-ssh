@@ -1,0 +1,30 @@
+{
+  "name": "oci-ssh",
+  "version": "1.0.0",
+  "description": "SSH into your Oracle Cloud instance from a throwaway container. The private key lives in a Docker volume, not on your laptop's disk.",
+  "main": "index.js",
+  "packageManager": "pnpm@10.28.2",
+  "engines": {
+    "node": ">=18.0.0",
+    "pnpm": ">=8.0.0"
+  },
+  "scripts": {
+    "create-vm": "docker compose run --rm import-key && docker compose run --rm ssh",
+    "down": "docker compose down",
+    "nuke": "docker compose down -v --remove-orphans && docker images --filter \"reference=oci-ssh*\" -q | xargs -r docker rmi -f || true && docker image prune -f || true && docker builder prune -f || true && docker volume rm oci-keys oci-known-hosts || true",
+    "logs": "docker compose logs -f --tail=100",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mayankgupta1008/oci-ssh.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/mayankgupta1008/oci-ssh/issues"
+  },
+  "homepage": "https://github.com/mayankgupta1008/oci-ssh#readme"
+}
