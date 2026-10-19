@@ -1,6 +1,6 @@
 # OCI k3s + GitOps — Architecture, Steps & Discussion
 
-> **Status:** Planning only. No VM or infrastructure changes; this document is the only repository addition.
+> **Status:** Phase 1 complete — single-node k3s is installed and verified on the data volume. Phase 0 inputs and Phase 2 (Argo CD bootstrap) are next. No application workloads have been deployed yet.
 > **Target:** Small single-node ARM VM on Oracle Cloud (resource class intentionally generalized).
 > **Goal:** Run n8n, Nextcloud, and related open-source apps with the k3s + Argo CD GitOps architecture from the referenced article — not Docker Compose.
 >
@@ -41,7 +41,7 @@ The full article stack is tight but plausible on a small single-node VM if optio
 
 No public IP, hostname, username, disk identifier, or credential is recorded here.
 
-The data volume is mounted persistently via `/etc/fstab` using a UUID with `_netdev,nofail`. Because `nofail` alone can let k3s start with an empty root-disk directory, add the mount guard in §7.1.
+The data volume is mounted persistently via `/etc/fstab` using a UUID with `_netdev,nofail`. Because `nofail` alone can let k3s start with an empty root-disk directory, the mount guard in §7.1 is installed and active.
 
 ---
 
@@ -49,7 +49,7 @@ The data volume is mounted persistently via `/etc/fstab` using a UUID with `_net
 
 ### 3.1 Diagram
 
-The architecture diagram is maintained separately. Its share link is intentionally not embedded in this document.
+The editable Excalidraw source is [`OCI-K3S-ARCHITECTURE.excalidraw`](OCI-K3S-ARCHITECTURE.excalidraw), with a rendered [`SVG`](OCI-K3S-ARCHITECTURE.svg). No public share link is embedded.
 
 It covers five lanes:
 
@@ -421,6 +421,10 @@ Why:
 - Avoids filling the root disk.
 - Keeps cluster state on the larger volume.
 
+**Verified in this environment:** k3s `v1.36.5+k3s1` is running with the data volume as its data-dir; the node is `Ready`; CoreDNS, local-path-provisioner, and metrics-server are healthy. A test PVC wrote and read a file under `<DATA_VOLUME_MOUNT>/k3s/storage`, then the PVC/PV/pod were removed cleanly. The mount guard is installed and active; the negative test of starting with the volume unmounted was not performed.
+
+> **`kubectl` note:** `/usr/local/bin/kubectl` is a symlink to the k3s multicall binary. Running bare `sudo kubectl` uses k3s's default data-dir and recreates a second runtime-assets directory on the root disk (observed at roughly 237 MB). Use `sudo k3s --data-dir <DATA_VOLUME_MOUNT>/k3s kubectl ...` or `sudo K3S_DATA_DIR=<DATA_VOLUME_MOUNT>/k3s kubectl ...` instead. The server's systemd unit already uses the data volume.
+
 Guard against a missing mount. If the data volume is not mounted, k3s must not silently create empty state on the root disk:
 
 ```bash
@@ -564,29 +568,30 @@ You need both.
 
 ## 9. Phased implementation plan
 
-### Phase 0 — Decisions and prerequisites
+### Phase 0 — Decisions and prerequisites (in progress)
 
-- Confirm domain and Cloudflare nameserver move.
-- Confirm Infisical Cloud vs self-hosted.
-- Create a private GitOps repo.
-- Confirm OCI Object Storage bucket/region for restic.
-- Confirm phase 1 scope.
-- Preserve existing local configuration; ensure local environment files are gitignored.
+- [x] Confirm phase 1 scope.
+- [x] Preserve existing local configuration; ensure local environment files are gitignored.
+- [ ] Confirm domain and Cloudflare nameserver move.
+- [ ] Confirm Infisical Cloud vs self-hosted.
+- [ ] Create a private GitOps repo.
+- [ ] Confirm OCI Object Storage bucket/region for restic.
+- [ ] Confirm Authelia timing.
 
 **Done when:** all open decisions are resolved and repo/bucket exist.
 
-### Phase 1 — Base OS and k3s
+### Phase 1 — Base OS and k3s (k3s baseline complete)
 
-- Update Linux packages.
-- Add a non-root admin user if needed; SSH key-only.
-- Configure OCI Security List and host firewall: SSH only; no `80`/`443`/`6443`.
-- Verify `<DATA_VOLUME_MOUNT>` is mounted; create `<DATA_VOLUME_MOUNT>/k3s` root-owned.
-- Install k3s with `<DATA_VOLUME_MOUNT>/k3s` data-dir, Traefik and ServiceLB disabled.
-- Add the systemd mount guard from §7.1.
-- Verify `kubectl get nodes` is `Ready`.
-- Create a test PVC and confirm its host path is under `<DATA_VOLUME_MOUNT>/k3s/storage`.
+- [x] Verify `<DATA_VOLUME_MOUNT>` is mounted; create `<DATA_VOLUME_MOUNT>/k3s` root-owned.
+- [x] Install k3s with `<DATA_VOLUME_MOUNT>/k3s` data-dir, Traefik and ServiceLB disabled.
+- [x] Set kubeconfig mode `600` and cap container logs at `50Mi` / 3 files.
+- [x] Add the systemd mount guard from §7.1.
+- [x] Configure the host/OCI firewall so only SSH is externally reachable; `6443` and `10250` are blocked.
+- [x] Verify the node is `Ready` and system pods are healthy.
+- [x] Create a test PVC and confirm its host path is under `<DATA_VOLUME_MOUNT>/k3s/storage`.
+- [ ] Full OS package refresh (not required for the k3s baseline; do before app deployment).
 
-**Done when:** single-node cluster is healthy, a test PVC persists on the data volume, and k3s refuses to start if the data volume is absent.
+**Done when:** single-node cluster is healthy, a test PVC persists on the data volume, and the mount guard is installed. The negative unmount test was not performed.
 
 ### Phase 2 — Argo CD bootstrap
 
@@ -744,7 +749,7 @@ CPU is the tight resource, not RAM. Avoid building container images on the VM; u
 | Auth | Access only vs Authelia | Access first; Authelia later | Pending |
 | Scope | Core vs full article | Core first; defer optional | Confirmed |
 | Resources | Stay small vs resize | Stay on the existing resource class | Confirmed |
-| Storage topology | Separate volumes vs merged pool | Keep separate; k3s data-dir on the data volume | Recommended |
+| Storage topology | Separate volumes vs merged pool | Keep separate; k3s data-dir on the data volume | Confirmed (implemented in Phase 1) |
 
 ---
 
@@ -766,8 +771,10 @@ CPU is the tight resource, not RAM. Avoid building container images on the VM; u
 - **Q&A — Infisical:** secrets manager; ESO pulls secrets into Kubernetes Secrets; bootstrap secrets remain manual; Cloud free tier recommended for phase 1.
 - **Q&A — Argo CD:** runs in cluster; bootstrap install is outside Argo CD; app-of-apps references Git; app manifests live in Git, not inside Argo CD; Argo CD can manage itself after bootstrap.
 - **Q&A — backups:** OCI volume backups are crash-consistent, optional, and not application-consistent; GitOps does not back up PVC data; add `pg_dump` + restic + restore tests.
-- **Pending:** domain/access model, Infisical hosting, Git repo location, backup approach.
-- **No changes made** to the VM or infrastructure during planning; this document is the only repository addition.
+- **Phase 1 executed:** installed k3s `v1.36.5+k3s1` with the data volume as its data-dir, disabled bundled Traefik and ServiceLB, set kubeconfig mode `600`, capped container logs, and installed the systemd mount guard. The node is `Ready`; CoreDNS, local-path-provisioner, and metrics-server are healthy.
+- **PVC smoke test passed:** the test PVC wrote and read a file under `<DATA_VOLUME_MOUNT>/k3s/storage`; the PVC, PV, and pod were then removed and the storage directory was empty.
+- **`kubectl` correction:** bare `sudo kubectl` recreated a duplicate default runtime-assets directory on the root disk. Use the data-dir-aware command from §7.1. The duplicate was removed after confirming no open files or processes, and the cluster stayed healthy.
+- **Pending:** domain/access model, Infisical hosting, Git repo location, backup bucket, and Authelia timing.
 
 ---
 
@@ -813,10 +820,18 @@ The article is a good architecture reference, but several details are homelab-sp
 
 This plan lives at `docs/OCI-K3S-GITOPS-PLAN.md`.
 
-1. Confirm the four open decisions:
+Phase 1 is complete. Next:
+
+1. Resolve the Phase 0 inputs:
    - domain/registrar and Cloudflare nameservers
    - Infisical Cloud vs self-hosted
-   - new private GitOps repo
+   - private GitOps repo URL and credentials
    - OCI Object Storage bucket/region for restic
-2. Switch from planning to implementation.
-3. Begin Phase 0/1 only after approval.
+   - Authelia timing
+2. Bootstrap Argo CD. This can be installed before the domain is ready; use `kubectl port-forward` for initial admin access.
+3. Add the app-of-apps root once the private GitOps repo exists.
+4. Install Traefik and Cloudflare Tunnel after the domain/Tunnel token is available.
+5. Install ESO/Infisical after the Infisical decision.
+6. Add backup/restore checks before stateful apps.
+
+Each VM write step requires explicit approval.
