@@ -53,14 +53,14 @@ The data volume is mounted persistently via `/etc/fstab` using a UUID with `_net
 
 ### 3.1 Diagram
 
-The editable Excalidraw source is [`OCI-K3S-ARCHITECTURE.excalidraw`](OCI-K3S-ARCHITECTURE.excalidraw), with a rendered [`SVG`](OCI-K3S-ARCHITECTURE.svg). No public share link is embedded. The diagram predates the wildcard routing and Homepage dashboard (§4.8–§4.10); it still shows a per-app public hostname.
+The editable Excalidraw source is [`OCI-K3S-ARCHITECTURE.excalidraw`](OCI-K3S-ARCHITECTURE.excalidraw), with a rendered [`SVG`](OCI-K3S-ARCHITECTURE.svg). No public share link is embedded. Updated 2026-10-21 for the Access-first setup, wildcard routing to the Homepage dashboard and apps (§4.8–§4.10), and Renovate image updates (§6.7).
 
 It covers five lanes:
 
 1. One-time domain setup
 2. Public request path
 3. Private admin path
-4. GitOps and secrets
+4. GitOps, secrets, and image updates
 5. Backups
 
 ### 3.2 Component map
