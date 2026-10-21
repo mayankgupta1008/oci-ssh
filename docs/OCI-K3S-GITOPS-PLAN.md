@@ -1,8 +1,8 @@
 # OCI k3s + GitOps — Architecture, Steps & Discussion
 
-> **Status:** Phase 1 complete — single-node k3s is installed and verified on the data volume. Phase 0 inputs and Phase 2 (Argo CD bootstrap) are next. No application workloads have been deployed yet.
+> **Status:** Phase 1 complete — single-node k3s is installed and verified on the data volume. Phase 0 inputs and Phase 2 (Argo CD bootstrap) are next. No application workloads have been deployed yet. The Homepage dashboard and wildcard subdomain routing (§4.8–§4.10) were added to the design on 2026-10-21; none of it is deployed yet.
 > **Target:** Small single-node ARM VM on Oracle Cloud (resource class intentionally generalized).
-> **Goal:** Run n8n, Nextcloud, and related open-source apps with the k3s + Argo CD GitOps architecture from the referenced article — not Docker Compose.
+> **Goal:** Run n8n, Nextcloud, and related open-source apps with the k3s + Argo CD GitOps architecture from the referenced article — not Docker Compose. `https://<DOMAIN>` opens a Homepage dashboard with one card per app; each card links to the app's own subdomain, such as `https://n8n.<DOMAIN>`.
 >
 > **Privacy note:** No public IPs, hostnames, domains, usernames, local paths, or credentials are recorded in this document. All environment-specific values are placeholders.
 
@@ -16,6 +16,10 @@ Recommended shape:
 
 - **One domain**, DNS managed by Cloudflare.
 - **Cloudflare Tunnel** for public access; no inbound `80`/`443` and no A record to the VM.
+- **Two tunnel hostnames only:** `<DOMAIN>` and `*.<DOMAIN>`, both routed to Traefik. Adding an app takes one Kubernetes `Ingress`; DNS and the tunnel stay unchanged.
+- **Homepage dashboard** at `<DOMAIN>`. Cards are discovered from app `Ingress` annotations and link to `<app>.<DOMAIN>`.
+- **No load balancer:** no MetalLB, k3s ServiceLB, or OCI Load Balancer. `cloudflared` connects outbound and reaches Traefik through its `ClusterIP` Service.
+- **Cloudflare Access** gates `<DOMAIN>` and `*.<DOMAIN>` before any hostname goes live.
 - **Tailscale** for private admin access (SSH, kubectl, Argo CD) where possible.
 - **k3s** with Traefik and ServiceLB disabled; Traefik installed separately as a `ClusterIP` service.
 - **Argo CD** bootstrapped once, then managing itself and all apps from Git.
@@ -49,7 +53,7 @@ The data volume is mounted persistently via `/etc/fstab` using a UUID with `_net
 
 ### 3.1 Diagram
 
-The editable Excalidraw source is [`OCI-K3S-ARCHITECTURE.excalidraw`](OCI-K3S-ARCHITECTURE.excalidraw), with a rendered [`SVG`](OCI-K3S-ARCHITECTURE.svg). No public share link is embedded.
+The editable Excalidraw source is [`OCI-K3S-ARCHITECTURE.excalidraw`](OCI-K3S-ARCHITECTURE.excalidraw), with a rendered [`SVG`](OCI-K3S-ARCHITECTURE.svg). No public share link is embedded. The diagram predates the wildcard routing and Homepage dashboard (§4.8–§4.10); it still shows a per-app public hostname.
 
 It covers five lanes:
 
@@ -68,10 +72,11 @@ It covers five lanes:
 | Ingress | Traefik v3 | Host-based routing inside cluster | 3 |
 | Tunnel | `cloudflared` | Outbound-only public ingress | 3 |
 | TLS | Cloudflare edge | Public HTTPS termination | 3 |
+| Dashboard | Homepage | Landing page at `<DOMAIN>`; app cards from `Ingress` annotations | 3 |
 | Optional TLS | cert-manager + Cloudflare DNS-01 | Internal/private TLS or future direct ingress | 3+ |
 | Secrets | Infisical + ESO | Secret source of truth → Kubernetes Secrets | 4 |
 | Apps | n8n, Nextcloud | Primary workloads | 5 |
-| Auth | Cloudflare Access, optional Authelia | Edge and app-level access control | 6 |
+| Auth | Cloudflare Access, optional Authelia | Edge gate (Access) and app-level SSO (Authelia) | 3, 6 |
 | Backups | OCI volume backups + restic + `pg_dump` | Disk DR + app-consistent backups | 7 |
 | Deferred | Zot, GitHub runner, AdGuard, Headlamp | Registry, CI, DNS, UI | 8 |
 
@@ -79,22 +84,24 @@ It covers five lanes:
 
 ```text
 User
- │  https://n8n.<DOMAIN>
+ │  https://<DOMAIN>  or  https://n8n.<DOMAIN>
  ▼
 Cloudflare edge
- │  TLS terminated at Cloudflare
- │  optional Cloudflare Access
+ │  TLS terminated at Cloudflare (Universal SSL: <DOMAIN> + *.<DOMAIN>)
+ │  Cloudflare Access login
  ▼
 Encrypted Cloudflare Tunnel
  │  cloudflared in k3s connects OUT to Cloudflare
+ │  tunnel publishes only <DOMAIN> and *.<DOMAIN>, both → Traefik
  ▼
 Traefik (ClusterIP)
  │  routes by Host header
- ▼
-n8n Service → n8n Pod
+ ├─ <DOMAIN>        → Homepage (dashboard cards)
+ ├─ n8n.<DOMAIN>    → n8n Service → n8n Pod
+ └─ cloud.<DOMAIN>  → Nextcloud Service → Nextcloud Pod
 ```
 
-No inbound `80`/`443`. No A record to the VM. No port forwarding.
+No inbound `80`/`443`. No A record to the VM. No port forwarding. No load balancer (§4.8).
 
 ### 3.4 Private admin path
 
@@ -120,6 +127,8 @@ You need **one domain**, but you do **not** point it at the VM's public IP.
 
 Your current registrar is fine. Move the domain's nameservers to Cloudflare, then route hostnames through a Cloudflare Tunnel.
 
+The tunnel publishes exactly two hostnames: `<DOMAIN>` (the Homepage dashboard) and `*.<DOMAIN>` (every app). Traefik picks the app from the `Host` header, so a new app needs only an `Ingress`; DNS and the tunnel stay unchanged.
+
 ### 4.2 Exact steps
 
 1. **Buy or choose one domain.** One apex domain is enough; use subdomains per app.
@@ -131,26 +140,34 @@ Your current registrar is fine. Move the domain's nameservers to Cloudflare, the
 5. Wait until Cloudflare shows the zone as **Active**.
 6. **Create a Tunnel** in Cloudflare Zero Trust → Networks → Tunnels. Use the token-based install; copy the tunnel token.
 7. **Deploy `cloudflared` in k3s** with the token stored as a Kubernetes Secret.
-8. **Add Public Hostnames** in the tunnel:
-   - `n8n.<DOMAIN>` → `http://traefik.kube-system.svc.cluster.local:80`
-   - `cloud.<DOMAIN>` → `http://traefik.kube-system.svc.cluster.local:80`
-   - `auth.<DOMAIN>` → `http://traefik.kube-system.svc.cluster.local:80`
-   - `argocd.<DOMAIN>` → `http://traefik.kube-system.svc.cluster.local:80`
-9. Cloudflare creates a **proxied CNAME** for each hostname pointing to `<TUNNEL_ID>.cfargotunnel.com`.
-10. **OCI firewall:** allow SSH `22` only from the admin source; allow outbound `7844` TCP/UDP; close inbound `80`, `443`, `6443`.
-11. **TLS:** Cloudflare's edge certificate handles public HTTPS. The `cloudflared → Traefik` hop stays inside the encrypted tunnel, so plain HTTP is acceptable.
-12. **Access control:** put Cloudflare Access in front of admin hostnames. If using Authelia, avoid stacking both gates on the same hostname.
+8. **Create the Cloudflare Access gate first** (§4.6). With a wildcard hostname, every `Ingress` is public as soon as it exists, and Homepage has no built-in authentication.
+9. **Add two Public Hostnames** in the tunnel, both → `http://traefik.kube-system.svc.cluster.local:80`:
+   - `<DOMAIN>` — the dashboard
+   - `*.<DOMAIN>` — every app
+
+   The same ingress rules through the Cloudflare API (`PUT /accounts/<ACCOUNT_ID>/cfd_tunnel/<TUNNEL_ID>/configurations`), as the JobLens AI deploy script does:
+
+   ```json
+   "ingress": [
+     {"hostname": "<DOMAIN>",   "service": "http://traefik.kube-system.svc.cluster.local:80"},
+     {"hostname": "*.<DOMAIN>", "service": "http://traefik.kube-system.svc.cluster.local:80"},
+     {"service": "http_status:404"}
+   ]
+   ```
+
+10. **DNS:** Cloudflare creates the apex **proxied CNAME** to `<TUNNEL_ID>.cfargotunnel.com`. If the dashboard does not create the wildcard record, add a proxied CNAME `*` → `<TUNNEL_ID>.cfargotunnel.com` manually.
+11. **OCI firewall:** allow SSH `22` only from the admin source; allow outbound `7844` TCP/UDP; close inbound `80`, `443`, `6443`.
+12. **TLS:** Cloudflare's edge certificate handles public HTTPS. The `cloudflared → Traefik` hop stays inside the encrypted tunnel, so plain HTTP is acceptable. Turn on **SSL/TLS → Edge Certificates → Always Use HTTPS**.
+13. **Authelia (later):** avoid stacking it and Cloudflare Access on the same hostname.
 
 ### 4.3 DNS records
 
 | Hostname | Type | Target | Proxy |
 |---|---|---|---|
-| `n8n.<DOMAIN>` | CNAME | `<TUNNEL_ID>.cfargotunnel.com` | Proxied |
-| `cloud.<DOMAIN>` | CNAME | `<TUNNEL_ID>.cfargotunnel.com` | Proxied |
-| `auth.<DOMAIN>` | CNAME | `<TUNNEL_ID>.cfargotunnel.com` | Proxied |
-| `argocd.<DOMAIN>` | CNAME | `<TUNNEL_ID>.cfargotunnel.com` | Proxied |
+| `<DOMAIN>` (`@`) | CNAME | `<TUNNEL_ID>.cfargotunnel.com` | Proxied |
+| `*.<DOMAIN>` (`*`) | CNAME | `<TUNNEL_ID>.cfargotunnel.com` | Proxied |
 
-No A record to the VM.
+No A record to the VM, and no per-app records: `n8n.<DOMAIN>`, `cloud.<DOMAIN>`, `auth.<DOMAIN>`, and `argocd.<DOMAIN>` all resolve through the wildcard. A specific record, if one is ever added, overrides the wildcard for that name. Cloudflare allows proxied wildcard records on all plans.
 
 ### 4.4 Firewall rules
 
@@ -168,6 +185,8 @@ Cloudflare documents `7844` TCP/UDP as the required tunnel egress port; `443` is
 
 With Cloudflare Tunnel, public TLS is handled at Cloudflare's edge. A cert-manager wildcard certificate via Cloudflare DNS-01 is **not required for the public path**.
 
+Cloudflare's free Universal SSL certificate covers `<DOMAIN>` and first-level subdomains only. Keep app hostnames one level deep: `n8n.<DOMAIN>` works; `n8n.lab.<DOMAIN>` gets no valid edge certificate.
+
 Keep cert-manager only if:
 
 - you want internal/private hostnames with TLS,
@@ -179,6 +198,8 @@ This is a deliberate simplification from the article. The article's cert-manager
 ### 4.6 Cloudflare Access vs Authelia
 
 Do not stack both on the same hostname or you will get a double login.
+
+**Baseline gate (Phase 3):** one Cloudflare Access self-hosted application covering `<DOMAIN>` and `*.<DOMAIN>`, with an Allow policy for the admin email(s). The Free plan covers up to 50 users. Add separate Bypass applications for paths that must stay public, such as n8n webhooks and Nextcloud shares (§4.7).
 
 Options:
 
@@ -192,11 +213,112 @@ If Authelia is used as an OIDC provider, `auth.<DOMAIN>` (or the OIDC endpoints)
 
 - **n8n webhooks:** if Cloudflare Access protects `n8n.<DOMAIN>`, external webhook calls get redirected to a login page and fail. Bypass `/webhook/*`, use a separate `hooks.<DOMAIN>` hostname, or use a Cloudflare service token.
 - **Nextcloud public shares:** same issue; share links need an Access bypass or a separate hostname.
-- **Cloudflare Tunnel token mode:** hostnames live in the Cloudflare dashboard, not Git. If you want tunnel config in Git, use a locally-managed tunnel later.
+- **Cloudflare Tunnel token mode:** hostnames live in the Cloudflare dashboard, not Git. With the wildcard, only `<DOMAIN>` and `*.<DOMAIN>` live there; per-app hostnames live in Git as `Ingress` objects. If you want tunnel config in Git, use a locally-managed tunnel later.
 - **OCI ephemeral public IP:** can change on stop/start. Another reason not to hardcode an A record. Reserve the IP only if you ever use direct ingress.
 - **Zone must be on Cloudflare:** named Tunnel hostnames require the DNS zone to be managed by Cloudflare. Registrar can stay elsewhere.
+- **Wildcard does not cover the apex:** `*.<DOMAIN>` matches subdomains only, so `<DOMAIN>` needs its own tunnel hostname and DNS record.
+- **Cloudflare Free limits:** requests larger than 100 MB are rejected with `413`, and Cloudflare's CDN terms restrict serving video and large files that are not hosted on Cloudflare (Stream, R2). Reach media apps (Jellyfin, Immich) and very large uploads over Tailscale or the direct-IP alternative (§4.12).
+- **Scheme behind the tunnel:** Traefik must trust `X-Forwarded-*` headers from the `cloudflared` pods (§7.3); otherwise apps see `http` and can loop on HTTPS redirects.
 
-### 4.8 Private-only alternative
+### 4.8 No load balancer
+
+No MetalLB, no k3s ServiceLB, and no OCI Load Balancer. Nothing arrives from the internet: `cloudflared` dials out to Cloudflare and reaches Traefik through its `ClusterIP` Service, so there is no inbound traffic to balance.
+
+| Option | Verdict | Reason |
+|---|---|---|
+| MetalLB | No | Built for bare metal; its docs say it is generally not compatible with cloud providers, and OCI is not on its list. Layer 2 mode relies on ARP announcements that cloud networks generally do not honor; Oracle's MetalLB lab requires enabling Layer 2 networking for VLANs in the VCN, which it describes as not generally available. The VM has one public IP anyway. |
+| k3s ServiceLB | No (stays disabled) | Only needed if Traefik must bind `80`/`443` on the node — the direct-IP alternative (§4.12). |
+| OCI Load Balancer | No | The Always Free Flexible Load Balancer is fixed at 10 Mbps; on a single node it adds a hop and gains nothing. |
+| Tunnel → Traefik `ClusterIP` | **Yes** | Free, no open ports, origin IP hidden, no reserved IP needed. |
+
+**JobLens AI comparison.** That project's local cluster (`infra/local-k8s`) runs KinD, MetalLB, and an nginx `api-gateway` Service of `type: LoadBalancer`. MetalLB exists there only because KinD on Docker Desktop has no LoadBalancer provider and the Mac needs a reachable Docker-bridge IP. None of that applies to an OCI VM.
+
+| Reuse from JobLens AI | Drop |
+|---|---|
+| `cloudflared` Deployment (token Secret, `/ready` probes); bump its pinned `2025.1.0` image to a current release (`2026.10.2` as of 2026-10-21) | KinD and MetalLB |
+| Tunnel configuration through the Cloudflare API (`PUT .../cfd_tunnel/<TUNNEL_ID>/configurations`) | nginx `api-gateway` `LoadBalancer`; Traefik `Ingress` is the gateway here |
+| Argo CD `Application` objects with automated prune and self-heal | Gitea (use the private GitOps repo) and Vault (this plan uses Infisical, or SOPS) |
+
+### 4.9 Dashboard at `<DOMAIN>` (Homepage)
+
+[Homepage](https://gethomepage.dev) serves the landing page. With `mode: cluster` it reads the Kubernetes API through its ServiceAccount and builds one card per annotated `Ingress`, linking to that app's subdomain. No card list is maintained by hand.
+
+Deploy it from the official raw manifests on Homepage's Kubernetes install page (ServiceAccount, token Secret, ConfigMap, ClusterRole and binding, Service, Deployment, Ingress), synced by Argo CD from `manifests/homepage/`. Skip the unofficial Helm chart: its latest release (May 2025) ships Homepage v1.2.0, while Homepage is at v2.6.0 (released 2026-10-17).
+
+Changes from the docs example:
+
+```yaml
+# ConfigMap: kubernetes.yaml
+mode: cluster              # in-cluster ServiceAccount; Ingress discovery is on by default
+
+# Deployment
+image: ghcr.io/gethomepage/homepage:v2.6.0   # pinned; the docs example uses :latest
+env:
+  - name: MY_POD_IP
+    valueFrom:
+      fieldRef:
+        fieldPath: status.podIP
+  - name: HOMEPAGE_ALLOWED_HOSTS
+    value: "$(MY_POD_IP):3000,<DOMAIN>"      # pod IP entry is needed for the probes; never "*"
+
+# Ingress
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: <DOMAIN>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: homepage
+                port:
+                  number: 3000
+```
+
+- Homepage has **no built-in authentication**; its docs require an authenticating reverse proxy for public deployments. The Access gate (§4.6) must exist before `<DOMAIN>` goes live.
+- Cluster CPU/memory widgets use metrics-server, which k3s already runs.
+- Service widgets call app APIs from the Homepage pod: point `gethomepage.dev/widget.url` at the internal Service URL (`http://<svc>.<namespace>.svc.cluster.local:<port>`), not the public hostname, which Access would block.
+
+### 4.10 Adding an app
+
+Each app needs a `ClusterIP` Service and one standard `Ingress`. The wildcard hostname and DNS record already cover the subdomain, and Homepage adds the card on its own.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: n8n
+  namespace: n8n
+  annotations:
+    gethomepage.dev/enabled: "true"
+    gethomepage.dev/name: n8n
+    gethomepage.dev/description: Workflow automation
+    gethomepage.dev/group: Automation
+    gethomepage.dev/icon: n8n.png
+    gethomepage.dev/href: https://n8n.<DOMAIN>
+    gethomepage.dev/pod-selector: app.kubernetes.io/name=n8n
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: n8n.<DOMAIN>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: n8n
+                port:
+                  number: 5678
+```
+
+- **Always set `gethomepage.dev/href`.** Homepage v2.6.0 uses `https` in a card link only when the `Ingress` has a `tls:` block (`src/utils/kubernetes/resource-helpers.js`). Tunnel-routed Ingresses need no `tls:` block because TLS ends at Cloudflare's edge, so without the annotation the card links to `http://`.
+- **Use `Ingress`, not Traefik `IngressRoute`,** for app routes. Homepage discovers `IngressRoute` objects only with `traefik: true` in `kubernetes.yaml`, and ignores any that lack `gethomepage.dev/href`.
+- `gethomepage.dev/pod-selector` selects the pods behind the card's status.
+
+### 4.11 Private-only alternative
 
 If you do not want a public domain:
 
@@ -208,6 +330,18 @@ If you do not want a public domain:
 Trade-off: n8n external webhooks and Nextcloud public shares will not work without Tailscale Funnel or a public tunnel.
 
 **Recommendation:** Cloudflare Tunnel + domain for public apps; Tailscale for SSH/kubectl/Argo CD admin.
+
+### 4.12 Direct public IP alternative
+
+Use only if Cloudflare's limits (§4.7) block a workload. It still needs no MetalLB:
+
+1. Remove `--disable servicelb` from the k3s server flags and set Traefik's Service back to `LoadBalancer`; ServiceLB then binds `80`/`443` on the node.
+2. Open `80`/`443` in the OCI security list **and** the host firewall; the Oracle Ubuntu image rejects all new inbound connections except SSH.
+3. Reserve the public IP so DNS survives instance recreation.
+4. DNS: `A @` and `A *` → the public IP.
+5. Issue a cert-manager wildcard certificate for `<DOMAIN>` and `*.<DOMAIN>` via Cloudflare DNS-01 and set it as Traefik's default certificate.
+
+Trade-offs: the origin IP is exposed and scanned, certificate renewal becomes your job, and Cloudflare Access cannot gate DNS-only records. Not the default.
 
 ---
 
@@ -342,9 +476,11 @@ gitops/
 │   ├── infisical.yaml
 │   ├── cloudflared.yaml
 │   ├── authelia.yaml
+│   ├── homepage.yaml
 │   ├── n8n.yaml
 │   └── nextcloud.yaml
 └── manifests/
+    ├── homepage/
     ├── n8n/
     └── nextcloud/
 ```
@@ -379,10 +515,41 @@ Install CRDs and controllers before custom resources:
 1. Namespaces
 2. Traefik, cert-manager, ESO, Infisical
 3. `SecretStore` / `ExternalSecret`
-4. n8n, Nextcloud
+4. Homepage, n8n, Nextcloud
 5. Authelia, cloudflared
 
 Use `argocd.argoproj.io/sync-wave` annotations or separate apps.
+
+### 6.7 Image updates
+
+Argo CD deploys what Git says. It polls the GitOps repo every three minutes; it does **not** watch container registries. A new upstream n8n image changes nothing until its tag changes in Git.
+
+Pin every image tag and chart version in Git, and let a bot bump them:
+
+```text
+n8n publishes a new image
+        │
+        ▼
+Renovate opens a PR bumping the tag in manifests/n8n/kustomization.yaml
+        │  review it, or automerge patch releases
+        ▼
+Merge to main
+        │
+        ▼
+Argo CD syncs within ~3 minutes → rolling update
+```
+
+| Option | Verdict | Notes |
+|---|---|---|
+| Renovate (free GitHub app) | **Recommended** | Runs outside the cluster, so it costs the VM nothing. Every upgrade is a reviewable, revertable PR. Also bumps Helm chart versions (Traefik, Argo CD) and images such as `cloudflared` and Homepage. The `kustomize` manager reads `images:` in `kustomization.yaml` by default; the `argocd` and `kubernetes` managers need `managerFilePatterns`. |
+| Argo CD Image Updater (`v1.3.1` as of 2026-10-21) | Alternative | In-cluster controller that polls registries and writes the new tag back to Git. Configured with the `ImageUpdater` CRD since v1.0. Supports Helm and Kustomize apps, not plain manifests. Adds a controller and registry polling to a small VM. |
+| `:latest` + `imagePullPolicy: Always` | Avoid | Git never changes, so Argo CD never redeploys; upgrades land at random pod restarts, with no audit trail or rollback. |
+
+Rules:
+
+- Keep each app's image in a Kustomize `images:` entry (or a Helm `image.tag` value) so either tool can update it.
+- Automerge only patch updates of stateless apps. n8n and Nextcloud run database migrations on upgrade: take the Phase 7 dump, then merge.
+- A GitHub webhook to Argo CD removes the three-minute delay, but it has to pass the Access gate (a bypass for the webhook path). Polling is enough.
 
 ---
 
@@ -461,9 +628,21 @@ If you later want more flexible data-volume management, put LVM on the data disk
 ### 7.3 Traefik
 
 - Disable k3s's bundled Traefik.
-- Install Traefik v3 separately as a `ClusterIP` service.
+- Install Traefik v3 separately as a `ClusterIP` service (pinned Helm chart; `v42.1.0` as of 2026-10-21).
 - Cloudflare Tunnel points at `traefik.kube-system.svc.cluster.local:80`.
 - Do not expose Traefik via NodePort or LoadBalancer.
+- Trust forwarded headers from the pod network. Requests from `cloudflared` carry `X-Forwarded-Proto: https` from Cloudflare's edge; from an untrusted source, Traefik overwrites it with `http`, and apps then build `http` links or loop on redirects.
+
+```yaml
+# Traefik chart values (v42.x keeps the Service type under service.spec)
+service:
+  spec:
+    type: ClusterIP
+ports:
+  web:
+    forwardedHeaders:
+      trustedIPs: ["10.42.0.0/16"]   # k3s default cluster CIDR, where cloudflared pods run
+```
 
 ### 7.4 Swap
 
@@ -595,25 +774,30 @@ You need both.
 
 ### Phase 2 — Argo CD bootstrap
 
-- Install Argo CD (pinned version) into `argocd`.
+- Install Argo CD (pinned version; `v3.5.6` as of 2026-10-21) into `argocd`.
 - Install the `argocd` CLI locally.
 - Create the private GitOps repo and root app.
-- Expose Argo CD through the Tunnel (or Tailscale first).
+- Reach Argo CD with `kubectl port-forward` or Tailscale; publish it through the Tunnel only after the Phase 3 Access gate exists.
 - Apply root app; confirm `Synced`/`Healthy`.
+- Pin image tags and chart versions; enable Renovate on the GitOps repo (§6.7).
 
 **Done when:** Argo CD can sync a test app from Git.
 
-### Phase 3 — Ingress and Tunnel
+### Phase 3 — Ingress, Tunnel, Access gate, and dashboard
 
-- Install Traefik v3 as `ClusterIP`.
+- Install Traefik v3 as `ClusterIP` with the forwarded-header trust from §7.3.
+- Create the Cloudflare Access application for `<DOMAIN>` and `*.<DOMAIN>` (§4.6) **before** publishing any hostname.
 - Create `cloudflared` namespace and token Secret.
-- Deploy `cloudflared` (official chart or deployment).
-- Add public hostnames in Cloudflare.
-- Confirm `https://n8n.<DOMAIN>` reaches Traefik.
+- Deploy `cloudflared` (the JobLens AI Deployment with a current pinned image, or the official chart).
+- Add the two public hostnames `<DOMAIN>` and `*.<DOMAIN>` → Traefik, with a `http_status:404` catch-all (§4.2).
+- DNS: proxied CNAMEs `@` and `*` → `<TUNNEL_ID>.cfargotunnel.com`; turn on Always Use HTTPS.
+- Deploy Homepage at `<DOMAIN>` as the first app (§4.9).
+- Confirm `https://<DOMAIN>` shows the Access login, then the dashboard.
+- Confirm an unknown `https://<random>.<DOMAIN>` returns Traefik's `404` after login.
 - Confirm no inbound `80`/`443` is open on the VM.
 - Optional: install cert-manager only if internal TLS is needed.
 
-**Done when:** a test HTTP service is reachable through the Tunnel and the VM's public IP does not serve it.
+**Done when:** Homepage is reachable at `https://<DOMAIN>` behind Access, and the VM's public IP serves nothing.
 
 ### Phase 4 — Secrets
 
@@ -634,15 +818,15 @@ You need both.
   - `N8N_PROXY_HOPS=1`
   - `N8N_ENCRYPTION_KEY` from Infisical
 - Deploy Nextcloud with a local-path PVC; the provisioner stores it under `<DATA_VOLUME_MOUNT>/k3s/storage`.
-- Configure Traefik `IngressRoute` per hostname.
+- Add one standard `Ingress` per app with `gethomepage.dev/*` annotations, including `href` (§4.10). No DNS or tunnel change is needed.
 - Verify data survives pod restart.
 - Configure n8n webhook path/Access bypass.
 
-**Done when:** both apps are reachable, persistent, and their secrets come from Infisical.
+**Done when:** both apps are reachable, persistent, shown as dashboard cards, and their secrets come from Infisical.
 
 ### Phase 6 — Access control
 
-- Start with Cloudflare Access for admin hostnames.
+- The Cloudflare Access gate exists from Phase 3; tighten per-app policies and add the public-path bypasses.
 - Add Authelia only if app-level SSO is required.
 - Configure OIDC client(s) and ForwardAuth.
 - Add Access bypass for the Authelia auth hostname/OIDC endpoints.
@@ -686,13 +870,14 @@ Approximate **requests**, not limits. Adjust to the actual node size:
 | Argo CD | 0.20 | 512 MiB |
 | Traefik | 0.10 | 128 MiB |
 | cloudflared | 0.05 | 64 MiB |
+| Homepage | 0.05 | 128 MiB |
 | ESO | 0.10 | 128 MiB |
 | Authelia | 0.10 | 128 MiB |
 | n8n | 0.25 | 512 MiB |
 | Nextcloud | 0.25 | 512 MiB |
 | Postgres | 0.25 | 512 MiB |
 | Redis | 0.10 | 128 MiB |
-| **Total** | **~1.65** | **~3.6 GiB** |
+| **Total** | **~1.70** | **~3.7 GiB** |
 
 CPU is the tight resource, not RAM. Avoid building container images on the VM; use GitHub-hosted runners or defer the self-hosted runner. Infisical Cloud keeps the secrets stack off the VM; self-hosting adds ~0.3 CPU / 1 GiB plus Postgres/Redis.
 
@@ -704,7 +889,8 @@ CPU is the tight resource, not RAM. Avoid building container images on the VM; u
 - [ ] SSH restricted to the admin source or Tailscale.
 - [ ] Inbound `80`/`443`/`6443` closed.
 - [ ] Cloudflare Tunnel only; no A record to the VM.
-- [ ] Cloudflare Access for admin hostnames.
+- [ ] Cloudflare Access gate on `<DOMAIN>` and `*.<DOMAIN>` before hostnames go live (Homepage has no built-in auth).
+- [ ] `HOMEPAGE_ALLOWED_HOSTS` lists `<DOMAIN>` explicitly; never `*`.
 - [ ] Authelia configured without double-login loops.
 - [ ] No plaintext secrets in Git.
 - [ ] Infisical machine identity least privilege.
@@ -733,7 +919,8 @@ CPU is the tight resource, not RAM. Avoid building container images on the VM; u
 - **Cloudflare dependency:** Tunnel/Access outage affects public access.
 - **Infisical dependency:** if self-hosted and down, ESO cannot fetch new secrets; existing Kubernetes Secrets persist.
 - **Bootstrap secret loss:** losing the Infisical key, restic password, or k3s token complicates recovery.
-- **OCI Always Free limits:** check current limits and reclaim rules.
+- **OCI idle reclamation:** Oracle may reclaim an Always Free instance it deems idle — over 7 days, 95th-percentile CPU < 20%, network < 20%, and (A1 shapes) memory < 20%. With only k3s system pods running, memory use is well below 20%, so the VM is idle-eligible until workloads run. Upgrading the account to Pay As You Go is the commonly cited way out; Oracle does not charge for Always Free resources after an upgrade.
+- **Cloudflare Free limits:** 100 MB request cap and CDN terms on video and large files (§4.7).
 - **ARM64 images:** validate every image before deployment.
 - **Upgrades:** k3s, Argo CD, Traefik, ESO, and apps need a tested upgrade path.
 
@@ -742,11 +929,15 @@ CPU is the tight resource, not RAM. Avoid building container images on the VM; u
 | Decision | Options | Recommendation | Status |
 |---|---|---|---|
 | Domain/registrar | Own/buy; Cloudflare DNS | Use one domain; move nameservers to Cloudflare | Pending |
-| Public access | Tunnel vs Tailscale only | Tunnel + Tailscale admin | Pending |
+| Public access | Tunnel vs Tailscale only | Tunnel + Tailscale admin | Adopted |
+| App hostnames | Per-app tunnel hostnames vs wildcard | `<DOMAIN>` + `*.<DOMAIN>` → Traefik | Adopted |
+| Load balancer | MetalLB, ServiceLB, OCI LB, none | None — tunnel to Traefik `ClusterIP` | Adopted |
+| Dashboard | Homepage vs others | Homepage with `Ingress` autodiscovery | Adopted |
+| Image updates | Renovate PRs vs Argo CD Image Updater | Renovate; automerge patch updates of stateless apps only | Pending |
 | Infisical | Cloud vs self-host | Cloud free tier first | Pending |
 | Git repo | New private vs existing | New private GitOps repo | Pending |
 | Backups | OCI volume only vs + restic | OCI + restic + dumps | Pending |
-| Auth | Access only vs Authelia | Access first; Authelia later | Pending |
+| Auth | Access only vs Authelia | Access gate in Phase 3; Authelia later | Pending |
 | Scope | Core vs full article | Core first; defer optional | Confirmed |
 | Resources | Stay small vs resize | Stay on the existing resource class | Confirmed |
 | Storage topology | Separate volumes vs merged pool | Keep separate; k3s data-dir on the data volume | Confirmed (implemented in Phase 1) |
@@ -774,7 +965,13 @@ CPU is the tight resource, not RAM. Avoid building container images on the VM; u
 - **Phase 1 executed:** installed k3s `v1.36.5+k3s1` with the data volume as its data-dir, disabled bundled Traefik and ServiceLB, set kubeconfig mode `600`, capped container logs, and installed the systemd mount guard. The node is `Ready`; CoreDNS, local-path-provisioner, and metrics-server are healthy.
 - **PVC smoke test passed:** the test PVC wrote and read a file under `<DATA_VOLUME_MOUNT>/k3s/storage`; the PVC, PV, and pod were then removed and the storage directory was empty.
 - **`kubectl` correction:** bare `sudo kubectl` recreated a duplicate default runtime-assets directory on the root disk. Use the data-dir-aware command from §7.1. The duplicate was removed after confirming no open files or processes, and the cluster stayed healthy.
-- **Pending:** domain/access model, Infisical hosting, Git repo location, backup bucket, and Authelia timing.
+- **Q&A — dashboard (2026-10-21):** `<DOMAIN>` opens Homepage; cards come from `Ingress` annotations and link to `<app>.<DOMAIN>`. The tunnel publishes only `<DOMAIN>` and `*.<DOMAIN>`; Access gates both (§4.8–§4.10).
+- **Q&A — load balancer:** no MetalLB, ServiceLB, or OCI Load Balancer; `cloudflared` connects outbound to Traefik's `ClusterIP` (§4.8).
+- **Q&A — JobLens AI architecture:** reuse its `cloudflared` Deployment, tunnel API automation, and Argo CD `Application` pattern; drop KinD, MetalLB, the nginx `LoadBalancer` gateway, Gitea, and Vault.
+- **Q&A — image updates:** Argo CD syncs Git, not registries. Renovate bumps pinned tags by PR; after merge, Argo CD deploys within about three minutes (§6.7).
+- **Read-only VM check (2026-10-21):** node `Ready`; bundled Traefik and ServiceLB disabled; only CoreDNS, local-path-provisioner, and metrics-server running; nothing listening on `80`/`443`; the host firewall accepts new inbound connections only on SSH.
+- **Verified in source/docs:** Homepage v2.6.0 builds `https` card links only for Ingresses with a `tls:` block (§4.10); Traefik chart v42.1.0 sets the Service type under `service.spec.type` (§7.3).
+- **Pending:** domain and Cloudflare nameservers, Infisical hosting, Git repo location, backup bucket, and Authelia timing.
 
 ---
 
@@ -813,6 +1010,40 @@ The article is a good architecture reference, but several details are homelab-sp
   https://docs.oracle.com/en-us/iaas/Content/Block/Tasks/schedulingvolumebackups.htm
 - n8n webhook URL behind reverse proxy:  
   https://docs.n8n.io/hosting/configuration/configuration-examples/webhook-url/
+- Homepage Kubernetes installation:  
+  https://gethomepage.dev/installation/k8s/
+- Homepage Kubernetes configuration and annotations:  
+  https://gethomepage.dev/configs/kubernetes/
+- Homepage card URL scheme logic (v2.6.0):  
+  https://github.com/gethomepage/homepage/blob/v2.6.0/src/utils/kubernetes/resource-helpers.js
+- Unofficial Homepage Helm chart index:  
+  https://jameswynn.github.io/helm-charts/index.yaml
+- MetalLB cloud compatibility:  
+  https://metallb.io/installation/clouds/
+- Oracle MetalLB lab (Layer 2 VLAN requirement):  
+  https://docs.oracle.com/en/learn/ocne-metallb
+- OCI Always Free resources (Load Balancer limits, idle reclamation):  
+  https://docs.oracle.com/en-us/iaas/Content/FreeTier/resourceref.htm
+- Cloudflare wildcard DNS records:  
+  https://developers.cloudflare.com/dns/manage-dns-records/reference/wildcard-dns-records/
+- Cloudflare Universal SSL limitations:  
+  https://developers.cloudflare.com/ssl/edge-certificates/universal-ssl/limitations/
+- Cloudflare Tunnel configuration file (wildcard ingress rules):  
+  https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/configuration-file/
+- Cloudflare plans (Zero Trust Free: up to 50 users):  
+  https://www.cloudflare.com/plans/
+- Cloudflare request body limits by plan:  
+  https://developers.cloudflare.com/workers/about/limits
+- Cloudflare terms update (video and large files on the CDN):  
+  https://blog.cloudflare.com/updated-tos/
+- Traefik Helm chart values (v42.1.0):  
+  https://github.com/traefik/traefik-helm-chart/blob/v42.1.0/traefik/values.yaml
+- Argo CD Git polling and webhooks:  
+  https://argo-cd.readthedocs.io/en/stable/operator-manual/webhook/
+- Argo CD Image Updater:  
+  https://argocd-image-updater.readthedocs.io/en/stable/
+- Renovate Argo CD manager:  
+  https://docs.renovatebot.com/modules/manager/argocd/
 
 ---
 
@@ -830,7 +1061,7 @@ Phase 1 is complete. Next:
    - Authelia timing
 2. Bootstrap Argo CD. This can be installed before the domain is ready; use `kubectl port-forward` for initial admin access.
 3. Add the app-of-apps root once the private GitOps repo exists.
-4. Install Traefik and Cloudflare Tunnel after the domain/Tunnel token is available.
+4. After the domain is active: create the Access gate, install Traefik, deploy `cloudflared` with the `<DOMAIN>` and `*.<DOMAIN>` hostnames, then deploy Homepage as the first app (Phase 3).
 5. Install ESO/Infisical after the Infisical decision.
 6. Add backup/restore checks before stateful apps.
 
